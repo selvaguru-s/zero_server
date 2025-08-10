@@ -225,4 +225,4 @@ To extend the server:
 3. **Performance Issues**:
    - Monitor MongoDB index usage
    - Check memory usage for large datasets
-   - Consider log rotation for file-based logs
+   - Consider log rotation for file-based logs# zero_server
