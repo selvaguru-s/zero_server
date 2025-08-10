@@ -1,42 +1,64 @@
 #!/usr/bin/env python3
 """
 message_handler.py
-Message handling logic for different message types
+Message handling logic for different message types with Firebase auth
 """
 
 import json
 import uuid
 from datetime import datetime, timezone
-from config import VALID_API_KEYS
 from utils import identity_to_str, append_client_log
 
 class MessageHandler:
-    """Handle different types of incoming messages"""
+    """Handle different types of incoming messages with auth"""
     
-    def __init__(self, router, data_store, logger):
+    def __init__(self, router, data_store, logger, auth_manager):
         self.router = router
         self.data_store = data_store
         self.logger = logger
+        self.auth_manager = auth_manager
     
     def handle_hello(self, identity, msg):
-        """Handle client hello/registration message"""
+        """Handle client hello/registration message with API key validation"""
         client_id = msg.get('client_id')
         api_key = msg.get('api_key')
         
-        if not client_id or api_key not in VALID_API_KEYS:
-            self.logger.warning("Rejecting client %s due to invalid API key", client_id or "<no id>")
+        if not client_id or not api_key:
+            self.logger.warning("Rejecting client %s due to missing credentials", client_id or "<no id>")
             self._send_response(identity, {
                 'type': 'reject', 
-                'reason': 'Invalid or missing API key'
+                'reason': 'Missing client_id or api_key'
             })
             return
+        
+        # Validate API key through Firebase auth manager
+        if not self.auth_manager.validate_api_key(api_key):
+            self.logger.warning("Rejecting client %s due to invalid API key", client_id)
+            self._send_response(identity, {
+                'type': 'reject', 
+                'reason': 'Invalid API key'
+            })
+            return
+        
+        # Get user info for logging
+        user_info = self.auth_manager.get_user_by_api_key(api_key)
+        user_email = user_info.get('email', 'unknown') if user_info else 'unknown'
         
         is_new = self.data_store.add_or_update_client(
             identity, client_id, msg.get('hostname')
         )
         
         if is_new:
-            self.logger.info("Registered new client %s", client_id)
+            self.logger.info("Registered new client %s (user: %s)", client_id, user_email)
+        else:
+            self.logger.info("Updated client %s (user: %s)", client_id, user_email)
+        
+        # Log authentication event
+        self.data_store.log_client_event(
+            client_id, 
+            'authenticated', 
+            {'user_email': user_email, 'hostname': msg.get('hostname')}
+        )
         
         self._send_response(identity, {
             'type': 'ack', 

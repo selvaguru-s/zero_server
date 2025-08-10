@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 setup_mongodb.py
-MongoDB setup script to create database, collections, and indexes
+MongoDB setup script to create database, collections, and indexes with Firebase auth
 """
 
 import pymongo
-from config import MONGODB_URI, DATABASE_NAME, CLIENTS_COLLECTION, TASKS_COLLECTION, CLIENT_LOGS_COLLECTION
+from config import MONGODB_URI, DATABASE_NAME, CLIENTS_COLLECTION, TASKS_COLLECTION, CLIENT_LOGS_COLLECTION, API_KEYS_COLLECTION
 
 def setup_mongodb():
     """Set up MongoDB database with required collections and indexes"""
@@ -22,7 +22,7 @@ def setup_mongodb():
         print(f"✓ Using database: {DATABASE_NAME}")
         
         # Create collections
-        collections = [CLIENTS_COLLECTION, TASKS_COLLECTION, CLIENT_LOGS_COLLECTION]
+        collections = [CLIENTS_COLLECTION, TASKS_COLLECTION, CLIENT_LOGS_COLLECTION, API_KEYS_COLLECTION]
         for collection_name in collections:
             if collection_name not in db.list_collection_names():
                 db.create_collection(collection_name)
@@ -53,6 +53,14 @@ def setup_mongodb():
         logs_coll.create_index("task_id")
         logs_coll.create_index("timestamp")
         print("✓ Created indexes for client_logs collection")
+        
+        # API keys collection indexes
+        api_keys_coll = db[API_KEYS_COLLECTION]
+        api_keys_coll.create_index("api_key", unique=True)
+        api_keys_coll.create_index("user_id", unique=True)
+        api_keys_coll.create_index("created_at")
+        api_keys_coll.create_index("active")
+        print("✓ Created indexes for api_keys collection")
         
         print("\n✅ MongoDB setup completed successfully!")
         
