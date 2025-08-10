@@ -11,9 +11,6 @@ BIND_ADDR = "tcp://0.0.0.0:5555"
 WEBUI_ADDR = ("0.0.0.0", 8080)
 LOG_DIR = "logs_server"
 
-# -------- FIREBASE CONFIGURATION --------
-FIREBASE_SERVICE_ACCOUNT_PATH = "firebase-service-account.json"  # Path to your Firebase service account JSON
-
 # -------- MONGODB CONFIGURATION --------
 MONGODB_URI = "mongodb://192.168.1.12:27017"
 DATABASE_NAME = "zmq_server"
