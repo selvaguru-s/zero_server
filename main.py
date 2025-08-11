@@ -10,6 +10,7 @@ from logger_setup import setup_logger
 from data_models import DataStore
 from zmq_server import ZMQServer
 from flask_api import FlaskAPI
+from firebase_auth import FirebaseAuthManager
 
 def main():
     """Main application entry point"""
@@ -17,14 +18,17 @@ def main():
     logger = setup_logger("server")
     
     try:
+        # Initialize Firebase auth manager ONCE here
+        auth_manager = FirebaseAuthManager(FIREBASE_SERVICE_ACCOUNT_PATH, logger)
+        
         # Initialize data store
         data_store = DataStore(logger)
         
-        # Initialize ZMQ server
-        zmq_server = ZMQServer(data_store, logger)
+        # Initialize ZMQ server with shared auth manager
+        zmq_server = ZMQServer(data_store, logger, auth_manager)
         
-        # Initialize Flask API with Firebase auth
-        flask_api = FlaskAPI(data_store, zmq_server, logger, FIREBASE_SERVICE_ACCOUNT_PATH)
+        # Initialize Flask API with shared auth manager
+        flask_api = FlaskAPI(data_store, zmq_server, logger, auth_manager)
         
         # Start ZMQ message handling in a separate thread
         zmq_thread = threading.Thread(target=zmq_server.handle_incoming, daemon=True)
@@ -45,6 +49,8 @@ def main():
             data_store.close()
         if 'flask_api' in locals():
             flask_api.close()
+        if 'auth_manager' in locals():
+            auth_manager.close()
         logger.info("Server shutdown complete")
 
 if __name__ == '__main__':

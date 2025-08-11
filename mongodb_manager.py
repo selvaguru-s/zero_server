@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 mongodb_manager.py
-MongoDB connection and operations manager
+MongoDB connection and operations manager with dual storage approach
 """
 
 import pymongo
@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from config import MONGODB_URI, DATABASE_NAME, CLIENTS_COLLECTION, TASKS_COLLECTION, CLIENT_LOGS_COLLECTION
 
 class MongoDBManager:
-    """MongoDB connection and operations manager"""
+    """MongoDB connection and operations manager with streaming + aggregated storage"""
     
     def __init__(self, logger):
         self.logger = logger
@@ -18,7 +18,11 @@ class MongoDBManager:
         self.clients_collection = None
         self.tasks_collection = None
         self.logs_collection = None
+        self.aggregated_logs_collection = None  # New collection for final aggregated output
         self.connected = False
+        
+        # In-memory buffer for aggregating chunks per task
+        self._task_output_buffer = {}  # task_id -> {'chunks': [], 'sequence': int}
         
         self._connect()
         self._setup_indexes()
@@ -28,7 +32,7 @@ class MongoDBManager:
         try:
             self.client = pymongo.MongoClient(
                 MONGODB_URI,
-                serverSelectionTimeoutMS=5000,  # 5 second timeout
+                serverSelectionTimeoutMS=5000,
                 connectTimeoutMS=5000,
                 socketTimeoutMS=5000
             )
@@ -40,6 +44,7 @@ class MongoDBManager:
             self.clients_collection = self.db[CLIENTS_COLLECTION]
             self.tasks_collection = self.db[TASKS_COLLECTION]
             self.logs_collection = self.db[CLIENT_LOGS_COLLECTION]
+            self.aggregated_logs_collection = self.db['aggregated_task_output']  # New collection
             
             self.connected = True
             self.logger.info("Connected to MongoDB at %s", MONGODB_URI)
@@ -64,9 +69,14 @@ class MongoDBManager:
             self.tasks_collection.create_index("status")
             self.tasks_collection.create_index("created_at")
             
-            # Index for logs collection
+            # Index for streaming logs collection (for real-time viewing)
             self.logs_collection.create_index([("client_id", 1), ("timestamp", -1)])
-            self.logs_collection.create_index("task_id")
+            self.logs_collection.create_index([("task_id", 1), ("sequence", 1)])
+            self.logs_collection.create_index("timestamp")
+            
+            # Index for aggregated logs collection (for final output viewing)
+            self.aggregated_logs_collection.create_index("task_id", unique=True)
+            self.aggregated_logs_collection.create_index([("client_id", 1), ("completed_at", -1)])
             
             self.logger.info("MongoDB indexes created successfully")
             
@@ -120,7 +130,6 @@ class MongoDBManager:
             cursor = self.clients_collection.find().sort('last_seen', -1)
             clients = []
             for doc in cursor:
-                # Convert MongoDB document to the expected format
                 client = {
                     'identity_str': doc['client_id'],
                     'hostname': doc.get('hostname'),
@@ -168,6 +177,15 @@ class MongoDBManager:
             }
             
             result = self.tasks_collection.insert_one(doc)
+            
+            # Initialize output buffer for this task
+            self._task_output_buffer[task_id] = {
+                'chunks': [],
+                'sequence': 0,
+                'client_id': target_client_id,
+                'first_chunk_time': None
+            }
+            
             return result.acknowledged
             
         except Exception as e:
@@ -196,6 +214,10 @@ class MongoDBManager:
                 {'id': task_id},
                 {'$set': update_doc}
             )
+            
+            # If task is completed, create aggregated output
+            if status in ['completed', 'failed']:
+                self._create_aggregated_output(task_id, status, kwargs.get('exit_code'))
             
             return result.acknowledged
             
@@ -242,25 +264,101 @@ class MongoDBManager:
             return None
     
     def log_client_output(self, client_id, task_id, msg_id, output, timestamp=None):
-        """Log client output to MongoDB"""
+        """Log client output - both streaming and buffered for aggregation"""
         if not self.is_connected():
             return False
             
         try:
-            doc = {
+            # Parse timestamp
+            if isinstance(timestamp, str):
+                try:
+                    ts = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                except:
+                    ts = datetime.now(timezone.utc)
+            else:
+                ts = timestamp or datetime.now(timezone.utc)
+            
+            # Get sequence number for this task
+            if task_id not in self._task_output_buffer:
+                self._task_output_buffer[task_id] = {
+                    'chunks': [],
+                    'sequence': 0,
+                    'client_id': client_id,
+                    'first_chunk_time': ts
+                }
+            
+            buffer_info = self._task_output_buffer[task_id]
+            sequence = buffer_info['sequence']
+            buffer_info['sequence'] += 1
+            
+            # Store streaming chunk for real-time viewing
+            streaming_doc = {
                 'client_id': client_id,
                 'task_id': task_id,
                 'msg_id': msg_id,
                 'output': output,
-                'timestamp': timestamp or datetime.now(timezone.utc),
-                'log_type': 'output'
+                'sequence': sequence,
+                'timestamp': ts,
+                'log_type': 'output_stream'
             }
             
-            result = self.logs_collection.insert_one(doc)
+            result = self.logs_collection.insert_one(streaming_doc)
+            
+            # Add to buffer for aggregation
+            buffer_info['chunks'].append({
+                'output': output,
+                'sequence': sequence,
+                'timestamp': ts,
+                'msg_id': msg_id
+            })
+            
             return result.acknowledged
             
         except Exception as e:
             self.logger.error("Failed to log client output: %s", e)
+            return False
+    
+    def _create_aggregated_output(self, task_id, status, exit_code):
+        """Create aggregated output when task completes"""
+        if task_id not in self._task_output_buffer:
+            return False
+            
+        try:
+            buffer_info = self._task_output_buffer[task_id]
+            
+            # Sort chunks by sequence to ensure correct order
+            sorted_chunks = sorted(buffer_info['chunks'], key=lambda x: x['sequence'])
+            
+            # Combine all output chunks
+            combined_output = ''.join(chunk['output'] for chunk in sorted_chunks)
+            
+            # Create aggregated document
+            aggregated_doc = {
+                'task_id': task_id,
+                'client_id': buffer_info['client_id'],
+                'combined_output': combined_output,
+                'total_chunks': len(sorted_chunks),
+                'first_chunk_time': buffer_info['first_chunk_time'],
+                'completed_at': datetime.now(timezone.utc),
+                'exit_code': exit_code,
+                'status': status,
+                'output_size': len(combined_output),
+                'log_type': 'output_aggregated'
+            }
+            
+            # Store aggregated output
+            result = self.aggregated_logs_collection.insert_one(aggregated_doc)
+            
+            # Clean up buffer
+            del self._task_output_buffer[task_id]
+            
+            self.logger.info("Created aggregated output for task %s (%d chunks, %d bytes)", 
+                           task_id, len(sorted_chunks), len(combined_output))
+            
+            return result.acknowledged
+            
+        except Exception as e:
+            self.logger.error("Failed to create aggregated output for task %s: %s", task_id, e)
             return False
     
     def log_client_event(self, client_id, event_type, details, task_id=None):
@@ -286,7 +384,7 @@ class MongoDBManager:
             return False
     
     def get_client_logs(self, client_id, limit=100):
-        """Get logs for a specific client"""
+        """Get streaming logs for a specific client (for real-time viewing)"""
         if not self.is_connected():
             return []
             
@@ -300,6 +398,93 @@ class MongoDBManager:
         except Exception as e:
             self.logger.error("Failed to get logs for client %s: %s", client_id, e)
             return []
+    
+    def get_task_streaming_logs(self, task_id, limit=1000):
+        """Get streaming output chunks for a specific task (for live viewing)"""
+        if not self.is_connected():
+            return []
+            
+        try:
+            cursor = self.logs_collection.find(
+                {
+                    'task_id': task_id,
+                    'log_type': 'output_stream'
+                }
+            ).sort('sequence', 1).limit(limit)
+            
+            return list(cursor)
+            
+        except Exception as e:
+            self.logger.error("Failed to get streaming logs for task %s: %s", task_id, e)
+            return []
+    
+    def get_task_aggregated_output(self, task_id):
+        """Get final aggregated output for a completed task"""
+        if not self.is_connected():
+            return None
+            
+        try:
+            doc = self.aggregated_logs_collection.find_one({'task_id': task_id})
+            return doc
+            
+        except Exception as e:
+            self.logger.error("Failed to get aggregated output for task %s: %s", task_id, e)
+            return None
+    
+    def get_client_aggregated_outputs(self, client_id, limit=50):
+        """Get aggregated outputs for a client's completed tasks"""
+        if not self.is_connected():
+            return []
+            
+        try:
+            cursor = self.aggregated_logs_collection.find(
+                {'client_id': client_id}
+            ).sort('completed_at', -1).limit(limit)
+            
+            return list(cursor)
+            
+        except Exception as e:
+            self.logger.error("Failed to get aggregated outputs for client %s: %s", client_id, e)
+            return []
+    
+    def cleanup_old_streaming_logs(self, days_old=7):
+        """Clean up old streaming logs (keep aggregated ones)"""
+        if not self.is_connected():
+            return False
+            
+        try:
+            cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_old)
+            
+            result = self.logs_collection.delete_many({
+                'log_type': 'output_stream',
+                'timestamp': {'$lt': cutoff_date}
+            })
+            
+            self.logger.info("Cleaned up %d old streaming log entries", result.deleted_count)
+            return True
+            
+        except Exception as e:
+            self.logger.error("Failed to cleanup old streaming logs: %s", e)
+            return False
+    
+    def get_database_stats(self):
+        """Get database statistics"""
+        if not self.is_connected():
+            return {}
+            
+        try:
+            stats = {
+                'clients_count': self.clients_collection.count_documents({}),
+                'tasks_count': self.tasks_collection.count_documents({}),
+                'streaming_logs_count': self.logs_collection.count_documents({'log_type': 'output_stream'}),
+                'aggregated_logs_count': self.aggregated_logs_collection.count_documents({}),
+                'events_count': self.logs_collection.count_documents({'log_type': 'event'})
+            }
+            return stats
+            
+        except Exception as e:
+            self.logger.error("Failed to get database stats: %s", e)
+            return {}
     
     def close(self):
         """Close MongoDB connection"""

@@ -8,20 +8,19 @@ import zmq
 import json
 import uuid
 from datetime import datetime, timezone
-from config import BIND_ADDR, FIREBASE_SERVICE_ACCOUNT_PATH
+from config import BIND_ADDR
 from utils import parse_router_frames, identity_to_str
 from message_handler import MessageHandler
-from firebase_auth import FirebaseAuthManager
 
 class ZMQServer:
     """ZMQ ROUTER server for handling client connections with Firebase auth"""
     
-    def __init__(self, data_store, logger):
+    def __init__(self, data_store, logger, auth_manager):
         self.data_store = data_store
         self.logger = logger
         
-        # Initialize Firebase auth manager
-        self.auth_manager = FirebaseAuthManager(FIREBASE_SERVICE_ACCOUNT_PATH, logger)
+        # Use the shared auth manager instead of creating a new one
+        self.auth_manager = auth_manager
         
         # Set up ZMQ
         self.context = zmq.Context.instance()
@@ -29,7 +28,7 @@ class ZMQServer:
         self.router.bind(BIND_ADDR)
         self.logger.info("Bound ROUTER socket to %s", BIND_ADDR)
         
-        # Message handler with auth manager
+        # Message handler with shared auth manager
         self.message_handler = MessageHandler(self.router, data_store, logger, self.auth_manager)
     
     def handle_incoming(self):

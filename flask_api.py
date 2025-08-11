@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
 flask_api.py
-Flask REST API for the ZMQ server with Firebase authentication
+Flask REST API for the ZMQ server with Firebase authentication and streaming support
 """
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 from utils import sanitize_for_json
 from firebase_auth import FirebaseAuthManager
 import functools
+import json
+import time
 
 class FlaskAPI:
-    """Flask API wrapper for the ZMQ server with Firebase auth"""
+    """Flask API wrapper for the ZMQ server with Firebase auth and streaming support"""
     
     def __init__(self, data_store, zmq_server, logger, firebase_service_account_path):
         self.data_store = data_store
@@ -39,7 +41,15 @@ class FlaskAPI:
         self.app.route('/api/clients')(self.require_auth(self.api_clients))
         self.app.route('/api/tasks')(self.require_auth(self.api_tasks))
         self.app.route('/api/send', methods=['POST'])(self.require_auth(self.api_send))
+        
+        # Logging routes with different views
         self.app.route('/api/client/<client_id>/logs')(self.require_auth(self.api_client_logs))
+        self.app.route('/api/client/<client_id>/completed-tasks')(self.require_auth(self.api_client_completed_tasks))
+        
+        # Task-specific output routes
+        self.app.route('/api/task/<task_id>/output/stream')(self.require_auth(self.api_task_streaming_output))
+        self.app.route('/api/task/<task_id>/output/aggregated')(self.require_auth(self.api_task_aggregated_output))
+        self.app.route('/api/task/<task_id>/output/live')(self.require_auth(self.api_task_live_stream))
         
         # Public route
         self.app.route('/api/status')(self.api_status)
@@ -160,25 +170,116 @@ class FlaskAPI:
         return jsonify({"task_id": task_id, "status": "queued"})
     
     def api_client_logs(self, client_id):
-        """GET /api/client/<client_id>/logs - Get logs for a specific client"""
+        """GET /api/client/<client_id>/logs - Get streaming logs for a specific client"""
         limit = request.args.get('limit', 100, type=int)
         logs = self.data_store.get_client_logs(client_id, limit)
         return jsonify(sanitize_for_json(logs))
     
+    def api_client_completed_tasks(self, client_id):
+        """GET /api/client/<client_id>/completed-tasks - Get aggregated outputs for completed tasks"""
+        limit = request.args.get('limit', 50, type=int)
+        
+        if hasattr(self.data_store.mongodb, 'get_client_aggregated_outputs'):
+            outputs = self.data_store.mongodb.get_client_aggregated_outputs(client_id, limit)
+            return jsonify(sanitize_for_json(outputs))
+        else:
+            return jsonify({"error": "Aggregated outputs not available"}), 503
+    
+    def api_task_streaming_output(self, task_id):
+        """GET /api/task/<task_id>/output/stream - Get streaming chunks for a task"""
+        limit = request.args.get('limit', 1000, type=int)
+        
+        if hasattr(self.data_store.mongodb, 'get_task_streaming_logs'):
+            chunks = self.data_store.mongodb.get_task_streaming_logs(task_id, limit)
+            return jsonify(sanitize_for_json(chunks))
+        else:
+            return jsonify({"error": "Streaming logs not available"}), 503
+    
+    def api_task_aggregated_output(self, task_id):
+        """GET /api/task/<task_id>/output/aggregated - Get final combined output for a task"""
+        if hasattr(self.data_store.mongodb, 'get_task_aggregated_output'):
+            output = self.data_store.mongodb.get_task_aggregated_output(task_id)
+            if output:
+                return jsonify(sanitize_for_json(output))
+            else:
+                return jsonify({"error": "Aggregated output not found"}), 404
+        else:
+            return jsonify({"error": "Aggregated output not available"}), 503
+    
+    def api_task_live_stream(self, task_id):
+        """GET /api/task/<task_id>/output/live - Server-Sent Events for live output streaming"""
+        def generate():
+            """Generator for Server-Sent Events"""
+            last_sequence = 0
+            
+            while True:
+                try:
+                    # Get new chunks since last sequence
+                    if hasattr(self.data_store.mongodb, 'get_task_streaming_logs'):
+                        chunks = self.data_store.mongodb.get_task_streaming_logs(task_id, 1000)
+                        
+                        # Filter chunks newer than last_sequence
+                        new_chunks = [chunk for chunk in chunks if chunk.get('sequence', 0) > last_sequence]
+                        
+                        for chunk in sorted(new_chunks, key=lambda x: x.get('sequence', 0)):
+                            data = {
+                                'sequence': chunk.get('sequence'),
+                                'output': chunk.get('output'),
+                                'timestamp': chunk.get('timestamp').isoformat() if hasattr(chunk.get('timestamp'), 'isoformat') else str(chunk.get('timestamp')),
+                                'msg_id': chunk.get('msg_id')
+                            }
+                            yield f"data: {json.dumps(data)}\n\n"
+                            last_sequence = chunk.get('sequence', last_sequence)
+                        
+                        # Check if task is completed
+                        task = self.data_store.get_task(task_id)
+                        if task and task.get('status') in ['completed', 'failed']:
+                            # Send completion event
+                            completion_data = {
+                                'type': 'task_completed',
+                                'status': task['status'],
+                                'exit_code': task.get('exit_code')
+                            }
+                            yield f"data: {json.dumps(completion_data)}\n\n"
+                            break
+                    
+                    time.sleep(0.5)  # Poll every 500ms
+                    
+                except Exception as e:
+                    self.logger.error("Error in live stream for task %s: %s", task_id, e)
+                    error_data = {'type': 'error', 'message': str(e)}
+                    yield f"data: {json.dumps(error_data)}\n\n"
+                    break
+        
+        return Response(
+            generate(),
+            mimetype='text/event-stream',
+            headers={
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive'
+            }
+        )
+    
     def api_status(self):
         """GET /api/status - Get system status including MongoDB connection"""
-        status = {
+        base_status = {
             'mongodb_connected': self.data_store.mongodb.is_connected(),
             'total_clients': len(self.data_store.get_all_clients()),
             'total_tasks': len(self.data_store.get_all_tasks()),
             'auth_enabled': True
         }
-        return jsonify(status)
+        
+        # Add database statistics if available
+        if hasattr(self.data_store.mongodb, 'get_database_stats'):
+            db_stats = self.data_store.mongodb.get_database_stats()
+            base_status.update(db_stats)
+        
+        return jsonify(base_status)
     
     def run(self, host, port):
         """Start the Flask server"""
         self.logger.info("Starting Flask web UI with Firebase auth on %s:%d", host, port)
-        self.app.run(host=host, port=port)
+        self.app.run(host=host, port=port, threaded=True)
     
     def close(self):
         """Clean up resources"""

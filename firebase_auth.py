@@ -80,17 +80,39 @@ class FirebaseAuthManager:
         user_id = user_info['user_id']
         
         try:
-            # Check if user already has an API key
-            existing = self.api_keys_collection.find_one({'user_id': user_id})
+            # Use findAndModify operation to handle race conditions
+            # First, try to find and update existing active key
+            existing = self.api_keys_collection.find_one_and_update(
+                {
+                    'user_id': user_id,
+                    'active': True
+                },
+                {
+                    '$set': {
+                        'last_used': datetime.now(timezone.utc),
+                        'email': user_info.get('email'),
+                        'name': user_info.get('name'),
+                        'verified': user_info.get('verified', False)
+                    }
+                },
+                return_document=pymongo.ReturnDocument.AFTER
+            )
             
             if existing:
                 self.logger.info("Retrieved existing API key for user %s", user_id)
                 return existing['api_key']
             
+            # No existing active key found, create new one
+            # First deactivate any old keys for this user
+            self.api_keys_collection.update_many(
+                {'user_id': user_id},
+                {'$set': {'active': False, 'deactivated_at': datetime.now(timezone.utc)}}
+            )
+            
             # Generate new API key
             api_key = self.generate_api_key()
             
-            # Store in database
+            # Store new key with upsert to handle edge cases
             doc = {
                 'user_id': user_id,
                 'api_key': api_key,
@@ -98,14 +120,26 @@ class FirebaseAuthManager:
                 'name': user_info.get('name'),
                 'verified': user_info.get('verified', False),
                 'created_at': datetime.now(timezone.utc),
-                'last_used': None,
+                'last_used': datetime.now(timezone.utc),
                 'active': True
             }
             
-            self.api_keys_collection.insert_one(doc)
-            self.logger.info("Created new API key for user %s", user_id)
-            
-            return api_key
+            try:
+                self.api_keys_collection.insert_one(doc)
+                self.logger.info("Created new API key for user %s", user_id)
+                return api_key
+            except pymongo.errors.DuplicateKeyError:
+                # In case of race condition, try to get the existing key
+                existing = self.api_keys_collection.find_one({
+                    'user_id': user_id,
+                    'active': True
+                })
+                if existing:
+                    self.logger.info("Found existing API key after race condition for user %s", user_id)
+                    return existing['api_key']
+                else:
+                    self.logger.error("Race condition in API key creation for user %s", user_id)
+                    return None
             
         except Exception as e:
             self.logger.error("Failed to create/get API key for user %s: %s", user_id, e)
@@ -114,20 +148,18 @@ class FirebaseAuthManager:
     def validate_api_key(self, api_key):
         """Validate API key and update last_used timestamp"""
         try:
-            doc = self.api_keys_collection.find_one({
-                'api_key': api_key,
-                'active': True
-            })
+            result = self.api_keys_collection.find_one_and_update(
+                {
+                    'api_key': api_key,
+                    'active': True
+                },
+                {
+                    '$set': {'last_used': datetime.now(timezone.utc)}
+                },
+                return_document=pymongo.ReturnDocument.AFTER
+            )
             
-            if doc:
-                # Update last_used timestamp
-                self.api_keys_collection.update_one(
-                    {'api_key': api_key},
-                    {'$set': {'last_used': datetime.now(timezone.utc)}}
-                )
-                return True
-            
-            return False
+            return result is not None
             
         except Exception as e:
             self.logger.error("Failed to validate API key: %s", e)
@@ -156,6 +188,39 @@ class FirebaseAuthManager:
         except Exception as e:
             self.logger.error("Failed to get user by API key: %s", e)
             return None
+    
+    def cleanup_duplicate_keys(self, user_id):
+        """Clean up duplicate API keys for a user (keep the most recent active one)"""
+        try:
+            # Find all keys for this user
+            keys = list(self.api_keys_collection.find({
+                'user_id': user_id,
+                'active': True
+            }).sort('created_at', -1))
+            
+            if len(keys) <= 1:
+                return True  # No duplicates
+            
+            # Keep the most recent one, deactivate the rest
+            keep_key = keys[0]
+            for key in keys[1:]:
+                self.api_keys_collection.update_one(
+                    {'_id': key['_id']},
+                    {
+                        '$set': {
+                            'active': False,
+                            'deactivated_at': datetime.now(timezone.utc),
+                            'deactivation_reason': 'duplicate_cleanup'
+                        }
+                    }
+                )
+            
+            self.logger.info("Cleaned up %d duplicate API keys for user %s", len(keys) - 1, user_id)
+            return True
+            
+        except Exception as e:
+            self.logger.error("Failed to cleanup duplicate keys for user %s: %s", user_id, e)
+            return False
     
     def close(self):
         """Close MongoDB connection"""
