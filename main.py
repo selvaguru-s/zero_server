@@ -18,13 +18,13 @@ def main():
     logger = setup_logger("server")
     
     try:
-        # Initialize Firebase auth manager ONCE here
+        # Initialize Firebase auth manager
         auth_manager = FirebaseAuthManager(FIREBASE_SERVICE_ACCOUNT_PATH, logger)
         
         # Initialize data store
         data_store = DataStore(logger)
         
-        # Initialize ZMQ server with shared auth manager
+        # Initialize ZMQ server with auth manager
         zmq_server = ZMQServer(data_store, logger, auth_manager)
         
         # Initialize Flask API with shared auth manager

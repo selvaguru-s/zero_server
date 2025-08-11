@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 mongodb_manager.py
-MongoDB connection and operations manager with dual storage approach
+MongoDB connection and operations manager with enhanced error handling
 """
 
 import pymongo
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from config import MONGODB_URI, DATABASE_NAME, CLIENTS_COLLECTION, TASKS_COLLECTION, CLIENT_LOGS_COLLECTION
+import traceback
 
 class MongoDBManager:
     """MongoDB connection and operations manager with streaming + aggregated storage"""
@@ -50,7 +51,7 @@ class MongoDBManager:
             self.logger.info("Connected to MongoDB at %s", MONGODB_URI)
             
         except Exception as e:
-            self.logger.error("Failed to connect to MongoDB: %s", e)
+            self.logger.error("Failed to connect to MongoDB: %s\n%s", str(e), traceback.format_exc())
             self.connected = False
     
     def _setup_indexes(self):
@@ -81,7 +82,7 @@ class MongoDBManager:
             self.logger.info("MongoDB indexes created successfully")
             
         except Exception as e:
-            self.logger.error("Failed to create MongoDB indexes: %s", e)
+            self.logger.error("Failed to create MongoDB indexes: %s\n%s", str(e), traceback.format_exc())
     
     def is_connected(self):
         """Check if MongoDB connection is active"""
@@ -118,7 +119,7 @@ class MongoDBManager:
             return result.acknowledged
             
         except Exception as e:
-            self.logger.error("Failed to upsert client %s: %s", client_id, e)
+            self.logger.error("Failed to upsert client %s: %s\n%s", client_id, str(e), traceback.format_exc())
             return False
     
     def get_all_clients(self):
@@ -130,17 +131,21 @@ class MongoDBManager:
             cursor = self.clients_collection.find().sort('last_seen', -1)
             clients = []
             for doc in cursor:
-                client = {
-                    'identity_str': doc['client_id'],
-                    'hostname': doc.get('hostname'),
-                    'last_seen': doc['last_seen'].isoformat() if isinstance(doc['last_seen'], datetime) else doc['last_seen'],
-                    'created_at': doc.get('created_at', doc['last_seen']).isoformat() if isinstance(doc.get('created_at', doc['last_seen']), datetime) else doc.get('created_at', doc['last_seen'])
-                }
-                clients.append(client)
+                try:
+                    client = {
+                        'identity_str': doc['client_id'],
+                        'hostname': doc.get('hostname'),
+                        'last_seen': doc['last_seen'].isoformat() if isinstance(doc['last_seen'], datetime) else doc['last_seen'],
+                        'created_at': doc.get('created_at', doc['last_seen']).isoformat() if isinstance(doc.get('created_at', doc['last_seen']), datetime) else doc.get('created_at', doc['last_seen'])
+                    }
+                    clients.append(client)
+                except Exception as e:
+                    self.logger.warning("Error processing client document: %s", str(e))
+                    continue
             return clients
             
         except Exception as e:
-            self.logger.error("Failed to get clients from MongoDB: %s", e)
+            self.logger.error("Failed to get clients from MongoDB: %s\n%s", str(e), traceback.format_exc())
             return []
     
     def get_client_by_id(self, client_id):
@@ -155,7 +160,7 @@ class MongoDBManager:
             return None
             
         except Exception as e:
-            self.logger.error("Failed to get client %s: %s", client_id, e)
+            self.logger.error("Failed to get client %s: %s\n%s", client_id, str(e), traceback.format_exc())
             return None
     
     def insert_task(self, task_id, target_client_id, mode, payload):
@@ -189,7 +194,7 @@ class MongoDBManager:
             return result.acknowledged
             
         except Exception as e:
-            self.logger.error("Failed to insert task %s: %s", task_id, e)
+            self.logger.error("Failed to insert task %s: %s\n%s", task_id, str(e), traceback.format_exc())
             return False
     
     def update_task_status(self, task_id, status, **kwargs):
@@ -222,7 +227,7 @@ class MongoDBManager:
             return result.acknowledged
             
         except Exception as e:
-            self.logger.error("Failed to update task %s: %s", task_id, e)
+            self.logger.error("Failed to update task %s: %s\n%s", task_id, str(e), traceback.format_exc())
             return False
     
     def get_all_tasks(self, limit=100):
@@ -234,22 +239,26 @@ class MongoDBManager:
             cursor = self.tasks_collection.find().sort('created_at', -1).limit(limit)
             tasks = []
             for doc in cursor:
-                task = {
-                    'id': doc['id'],
-                    'target': doc['target'],
-                    'mode': doc.get('mode'),
-                    'payload': doc['payload'],
-                    'status': doc['status'],
-                    'created_at': doc['created_at'].isoformat() if isinstance(doc['created_at'], datetime) else doc['created_at'],
-                    'started_at': doc['started_at'].isoformat() if isinstance(doc['started_at'], datetime) and doc['started_at'] else doc['started_at'],
-                    'completed_at': doc['completed_at'].isoformat() if isinstance(doc['completed_at'], datetime) and doc['completed_at'] else doc['completed_at'],
-                    'exit_code': doc.get('exit_code')
-                }
-                tasks.append(task)
+                try:
+                    task = {
+                        'id': doc['id'],
+                        'target': doc['target'],
+                        'mode': doc.get('mode'),
+                        'payload': doc['payload'],
+                        'status': doc['status'],
+                        'created_at': doc['created_at'].isoformat() if isinstance(doc['created_at'], datetime) else doc['created_at'],
+                        'started_at': doc['started_at'].isoformat() if isinstance(doc['started_at'], datetime) and doc['started_at'] else doc['started_at'],
+                        'completed_at': doc['completed_at'].isoformat() if isinstance(doc['completed_at'], datetime) and doc['completed_at'] else doc['completed_at'],
+                        'exit_code': doc.get('exit_code')
+                    }
+                    tasks.append(task)
+                except Exception as e:
+                    self.logger.warning("Error processing task document: %s", str(e))
+                    continue
             return tasks
             
         except Exception as e:
-            self.logger.error("Failed to get tasks from MongoDB: %s", e)
+            self.logger.error("Failed to get tasks from MongoDB: %s\n%s", str(e), traceback.format_exc())
             return []
     
     def get_task(self, task_id):
@@ -260,7 +269,7 @@ class MongoDBManager:
         try:
             return self.tasks_collection.find_one({'id': task_id})
         except Exception as e:
-            self.logger.error("Failed to get task %s: %s", task_id, e)
+            self.logger.error("Failed to get task %s: %s\n%s", task_id, str(e), traceback.format_exc())
             return None
     
     def log_client_output(self, client_id, task_id, msg_id, output, timestamp=None):
@@ -315,7 +324,7 @@ class MongoDBManager:
             return result.acknowledged
             
         except Exception as e:
-            self.logger.error("Failed to log client output: %s", e)
+            self.logger.error("Failed to log client output: %s\n%s", str(e), traceback.format_exc())
             return False
     
     def _create_aggregated_output(self, task_id, status, exit_code):
@@ -358,7 +367,7 @@ class MongoDBManager:
             return result.acknowledged
             
         except Exception as e:
-            self.logger.error("Failed to create aggregated output for task %s: %s", task_id, e)
+            self.logger.error("Failed to create aggregated output for task %s: %s\n%s", task_id, str(e), traceback.format_exc())
             return False
     
     def log_client_event(self, client_id, event_type, details, task_id=None):
@@ -380,23 +389,50 @@ class MongoDBManager:
             return result.acknowledged
             
         except Exception as e:
-            self.logger.error("Failed to log client event: %s", e)
+            self.logger.error("Failed to log client event: %s\n%s", str(e), traceback.format_exc())
             return False
     
     def get_client_logs(self, client_id, limit=100):
         """Get streaming logs for a specific client (for real-time viewing)"""
         if not self.is_connected():
+            self.logger.warning("MongoDB not connected, returning empty logs for client %s", client_id)
             return []
             
         try:
+            self.logger.info("Querying logs for client_id: %s, limit: %d", client_id, limit)
+            
+            # Query with proper error handling
             cursor = self.logs_collection.find(
                 {'client_id': client_id}
             ).sort('timestamp', -1).limit(limit)
             
-            return list(cursor)
+            logs = []
+            for doc in cursor:
+                try:
+                    # Remove MongoDB ObjectId and handle datetime objects
+                    log_entry = {
+                        'client_id': doc.get('client_id'),
+                        'task_id': doc.get('task_id'),
+                        'msg_id': doc.get('msg_id'),
+                        'output': doc.get('output', ''),
+                        'event_type': doc.get('event_type'),
+                        'details': doc.get('details'),
+                        'timestamp': doc.get('timestamp').isoformat() if isinstance(doc.get('timestamp'), datetime) else str(doc.get('timestamp')),
+                        'log_type': doc.get('log_type'),
+                        'sequence': doc.get('sequence')
+                    }
+                    # Remove None values
+                    log_entry = {k: v for k, v in log_entry.items() if v is not None}
+                    logs.append(log_entry)
+                except Exception as e:
+                    self.logger.warning("Error processing log document for client %s: %s", client_id, str(e))
+                    continue
+            
+            self.logger.info("Successfully retrieved %d logs for client %s", len(logs), client_id)
+            return logs
             
         except Exception as e:
-            self.logger.error("Failed to get logs for client %s: %s", client_id, e)
+            self.logger.error("Failed to get logs for client %s: %s\n%s", client_id, str(e), traceback.format_exc())
             return []
     
     def get_task_streaming_logs(self, task_id, limit=1000):
@@ -412,10 +448,26 @@ class MongoDBManager:
                 }
             ).sort('sequence', 1).limit(limit)
             
-            return list(cursor)
+            logs = []
+            for doc in cursor:
+                try:
+                    log_entry = {
+                        'task_id': doc.get('task_id'),
+                        'client_id': doc.get('client_id'),
+                        'msg_id': doc.get('msg_id'),
+                        'output': doc.get('output', ''),
+                        'sequence': doc.get('sequence'),
+                        'timestamp': doc.get('timestamp').isoformat() if isinstance(doc.get('timestamp'), datetime) else str(doc.get('timestamp'))
+                    }
+                    logs.append(log_entry)
+                except Exception as e:
+                    self.logger.warning("Error processing streaming log for task %s: %s", task_id, str(e))
+                    continue
+            
+            return logs
             
         except Exception as e:
-            self.logger.error("Failed to get streaming logs for task %s: %s", task_id, e)
+            self.logger.error("Failed to get streaming logs for task %s: %s\n%s", task_id, str(e), traceback.format_exc())
             return []
     
     def get_task_aggregated_output(self, task_id):
@@ -425,10 +477,22 @@ class MongoDBManager:
             
         try:
             doc = self.aggregated_logs_collection.find_one({'task_id': task_id})
-            return doc
+            if doc:
+                # Clean up the document for JSON serialization
+                return {
+                    'task_id': doc.get('task_id'),
+                    'client_id': doc.get('client_id'),
+                    'combined_output': doc.get('combined_output', ''),
+                    'total_chunks': doc.get('total_chunks', 0),
+                    'output_size': doc.get('output_size', 0),
+                    'completed_at': doc.get('completed_at').isoformat() if isinstance(doc.get('completed_at'), datetime) else str(doc.get('completed_at')),
+                    'exit_code': doc.get('exit_code'),
+                    'status': doc.get('status')
+                }
+            return None
             
         except Exception as e:
-            self.logger.error("Failed to get aggregated output for task %s: %s", task_id, e)
+            self.logger.error("Failed to get aggregated output for task %s: %s\n%s", task_id, str(e), traceback.format_exc())
             return None
     
     def get_client_aggregated_outputs(self, client_id, limit=50):
@@ -441,10 +505,28 @@ class MongoDBManager:
                 {'client_id': client_id}
             ).sort('completed_at', -1).limit(limit)
             
-            return list(cursor)
+            outputs = []
+            for doc in cursor:
+                try:
+                    output = {
+                        'task_id': doc.get('task_id'),
+                        'client_id': doc.get('client_id'),
+                        'combined_output': doc.get('combined_output', ''),
+                        'total_chunks': doc.get('total_chunks', 0),
+                        'output_size': doc.get('output_size', 0),
+                        'completed_at': doc.get('completed_at').isoformat() if isinstance(doc.get('completed_at'), datetime) else str(doc.get('completed_at')),
+                        'exit_code': doc.get('exit_code'),
+                        'status': doc.get('status')
+                    }
+                    outputs.append(output)
+                except Exception as e:
+                    self.logger.warning("Error processing aggregated output for client %s: %s", client_id, str(e))
+                    continue
+            
+            return outputs
             
         except Exception as e:
-            self.logger.error("Failed to get aggregated outputs for client %s: %s", client_id, e)
+            self.logger.error("Failed to get aggregated outputs for client %s: %s\n%s", client_id, str(e), traceback.format_exc())
             return []
     
     def cleanup_old_streaming_logs(self, days_old=7):
@@ -464,7 +546,7 @@ class MongoDBManager:
             return True
             
         except Exception as e:
-            self.logger.error("Failed to cleanup old streaming logs: %s", e)
+            self.logger.error("Failed to cleanup old streaming logs: %s\n%s", str(e), traceback.format_exc())
             return False
     
     def get_database_stats(self):
@@ -483,7 +565,7 @@ class MongoDBManager:
             return stats
             
         except Exception as e:
-            self.logger.error("Failed to get database stats: %s", e)
+            self.logger.error("Failed to get database stats: %s\n%s", str(e), traceback.format_exc())
             return {}
     
     def close(self):
